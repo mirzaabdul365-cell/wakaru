@@ -680,7 +680,7 @@ export default function({ context = {}, ...rest } = {}) {
             onError
         });
         return (e)=>(t)=>{
-                if (sagaMonitor && sagaMonitor.actionDispatched) {
+                if (sagaMonitor?.actionDispatched) {
                     sagaMonitor.actionDispatched(t);
                 }
                 const n = e(t);

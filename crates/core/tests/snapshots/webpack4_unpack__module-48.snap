@@ -1695,7 +1695,7 @@ function un(e) {
     }
 }
 function ln(e) {
-    while(e && e.firstChild){
+    while(e?.firstChild){
         e = e.firstChild;
     }
     return e;
@@ -3157,7 +3157,7 @@ function Yo(e, t, n) {
     return 1073741821 - (1 + ((1073741821 - e + t / 10) / (n /= 10) | 0)) * n;
 }
 function Go(e, t) {
-    if (e && e.defaultProps) {
+    if (e?.defaultProps) {
         t = o({}, t);
         for(const n in e = e.defaultProps){
             if (t[n] === undefined) {
@@ -7517,7 +7517,7 @@ function El(e) {
             E = sn();
             w = x.focusedElem;
             l = x.selectionRange;
-            if (E !== w && w && w.ownerDocument && function e(t, n) {
+            if (E !== w && w?.ownerDocument && function e(t, n) {
                 return !(!t || !n) && (t === n || (!t || t.nodeType !== 3) && (n && n.nodeType === 3 ? e(t, n.parentNode) : "contains" in t ? t.contains(n) : !!t.compareDocumentPosition && !!(16 & t.compareDocumentPosition(n))));
             }(w.ownerDocument.documentElement, w)) {
                 if (l !== null && fn(w)) {

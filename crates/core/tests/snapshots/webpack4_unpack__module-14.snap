@@ -134,7 +134,7 @@ function f(e, t) {
     return e;
 }
 function d(e) {
-    if (e && e.sensitive) {
+    if (e?.sensitive) {
         return "";
     }
     return "i";

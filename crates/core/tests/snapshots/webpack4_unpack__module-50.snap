@@ -100,7 +100,7 @@ export function createElement(e, t, n) {
         }
         o.children = c;
     }
-    if (e && e.defaultProps) {
+    if (e?.defaultProps) {
         for(r in l = e.defaultProps){
             if (o[r] === undefined) {
                 o[r] = l[r];

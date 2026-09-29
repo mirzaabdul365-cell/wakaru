@@ -113,7 +113,39 @@ impl VisitMut for UnOptionalChaining {
             ) {
                 self.record_consumed_expr_bindings(if_stmt.test.as_ref(), &result);
                 *if_stmt.test = result;
+            } else if let Some(result) =
+                try_truthy_and_optional_chain(if_stmt.test.as_ref(), self.policy)
+            {
+                *if_stmt.test = result;
             }
+        }
+
+        // The tests of `while`, `do-while`, and `for` are boolean-coerced too, so
+        // a truthy guard chain there is recoverable on the same terms.
+        match stmt {
+            Stmt::While(loop_stmt) => {
+                if let Some(result) =
+                    try_truthy_and_optional_chain(loop_stmt.test.as_ref(), self.policy)
+                {
+                    *loop_stmt.test = result;
+                }
+            }
+            Stmt::DoWhile(loop_stmt) => {
+                if let Some(result) =
+                    try_truthy_and_optional_chain(loop_stmt.test.as_ref(), self.policy)
+                {
+                    *loop_stmt.test = result;
+                }
+            }
+            Stmt::For(for_stmt) => {
+                if let Some(test) = &mut for_stmt.test {
+                    if let Some(result) = try_truthy_and_optional_chain(test.as_ref(), self.policy)
+                    {
+                        **test = result;
+                    }
+                }
+            }
+            _ => {}
         }
 
         if let Some(result) =
@@ -452,16 +484,19 @@ fn try_boolean_context_logical_and_optional_chain(
         return None;
     };
 
+    let recovered = try_logical_and_optional_chain(
+        arg,
+        unresolved_mark,
+        policy,
+        uninitialized_bindings,
+        binding_references,
+    )
+    .or_else(|| try_truthy_and_optional_chain(arg, policy))?;
+
     Some(Expr::Unary(UnaryExpr {
         span: *span,
         op: UnaryOp::Bang,
-        arg: Box::new(try_logical_and_optional_chain(
-            arg,
-            unresolved_mark,
-            policy,
-            uninitialized_bindings,
-            binding_references,
-        )?),
+        arg: Box::new(recovered),
     }))
 }
 
@@ -489,6 +524,97 @@ fn try_logical_and_optional_chain(
         uninitialized_bindings,
         binding_references,
     )
+}
+
+/// Recover an idiomatic truthy short-circuit guard chain into an optional
+/// chain, e.g. `a && a.b && a.b.c` → `a?.b?.c`.
+///
+/// This is only invoked from boolean-context call sites (the test of an `if`
+/// and the operand of a logical-NOT), where only the truthiness of the result
+/// is observed. In value position the same shape is unsound: `a && a.b` yields
+/// `a` when `a` is a falsy-but-non-nullish primitive (`0`, `""`, `false`),
+/// whereas `a?.b` yields `undefined`. Restricting the recovery to boolean
+/// context preserves observable behavior.
+fn try_truthy_and_optional_chain(expr: &Expr, policy: RewritePolicy) -> Option<Expr> {
+    if policy.level < RewriteLevel::Standard {
+        return None;
+    }
+
+    let mut terms = Vec::new();
+    collect_logical_and_terms(expr, &mut terms);
+    if terms.len() < 2 {
+        return None;
+    }
+
+    let mut rewritten = Vec::with_capacity(terms.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < terms.len() {
+        if let Some((chain, consumed)) = try_truthy_chain_prefix(&terms[index..], policy) {
+            rewritten.push(chain);
+            index += consumed;
+            changed = true;
+        } else {
+            rewritten.push(terms[index].clone());
+            index += 1;
+        }
+    }
+
+    changed.then(|| build_logical_and_expr(rewritten))?
+}
+
+/// Consume the longest leading run of `&&` terms that forms a strict
+/// extend-by-one-member chain rooted at a stable identifier or `this`, and
+/// return the optional chain plus the number of terms consumed.
+fn try_truthy_chain_prefix(terms: &[&Expr], policy: RewritePolicy) -> Option<(Expr, usize)> {
+    let base = strip_parens(terms[0]);
+    if !matches!(base, Expr::Ident(_) | Expr::This(_)) {
+        return None;
+    }
+
+    let mut chain = base.clone();
+    let mut last = base;
+    let mut consumed = 1;
+
+    while consumed < terms.len() {
+        let next = strip_parens(terms[consumed]);
+        // Only member accesses extend the chain; a call term (`a.b()`) or any
+        // other shape ends it. The extending term's object must be structurally
+        // identical to the previously guarded expression.
+        let Expr::Member(MemberExpr { obj, prop, .. }) = next else {
+            break;
+        };
+        if !exprs_structurally_equal(strip_parens(obj), last) {
+            break;
+        }
+        chain = Expr::OptChain(OptChainExpr {
+            span: DUMMY_SP,
+            optional: true,
+            base: Box::new(OptChainBase::Member(MemberExpr {
+                span: DUMMY_SP,
+                obj: Box::new(chain),
+                prop: prop.clone(),
+            })),
+        });
+        last = next;
+        consumed += 1;
+    }
+
+    // Need the base plus at least one guarded access.
+    if consumed < 2 {
+        return None;
+    }
+
+    // A chain of three or more terms re-reads an intermediate member (`a.b` in
+    // `a && a.b && a.b.c`) which collapses to a single access in the recovered
+    // chain. That is observable if the member is a getter, so it requires the
+    // pure-getters assumption. Two-term chains only re-read the identifier base,
+    // which is side-effect-free.
+    if consumed >= 3 && !policy.assumptions.pure_getters {
+        return None;
+    }
+
+    Some((chain, consumed))
 }
 
 fn rewrite_logical_and_optional_chain_terms(
