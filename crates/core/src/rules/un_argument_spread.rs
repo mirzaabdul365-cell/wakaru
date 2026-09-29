@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
+use swc_core::common::{Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
     AssignOp, AssignTarget, AssignTargetPat, AutoAccessor, CallExpr, Callee, ClassProp,
     Constructor, Expr, ExprOrSpread, ExprStmt, ForHead, GetterProp, Ident, ImportDecl,
-    ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ObjectPatProp, OptChainBase, Pat,
-    PrivateProp, PropName, SetterProp, SimpleAssignTarget, StaticBlock, Stmt, UnaryExpr, UnaryOp,
-    UpdateExpr, VarDeclKind,
+    ImportSpecifier, Lit, MemberExpr, MemberProp, Module, NewExpr, ObjectPatProp, OptChainBase,
+    Pat, PrivateProp, PropName, SetterProp, SimpleAssignTarget, StaticBlock, Stmt, UnaryExpr,
+    UnaryOp, UpdateExpr, VarDeclKind,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -190,6 +190,32 @@ fn try_convert_apply(
         return Err(call);
     }
 
+    let is_reflect_construct = matches!(
+        callee_member.obj.as_ref(),
+        Expr::Ident(id) if id.sym.as_ref() == "Reflect"
+    ) && matches!(&callee_member.prop, MemberProp::Ident(id) if id.sym.as_ref() == "construct");
+
+    if is_reflect_construct && (call.args.len() == 2 || call.args.len() == 3) {
+        if !matches!(
+            callee_member.obj.as_ref(),
+            Expr::Ident(id) if is_unresolved_ident(id, "Reflect", unresolved_mark)
+        ) {
+            return Err(call);
+        }
+        if let Some(new_expr) = try_convert_reflect_construct(
+            &call,
+            callee_member,
+            unresolved_mark,
+            stable_bindings,
+            with_depth,
+            top_level_direct_eval,
+            direct_eval_scopes,
+        ) {
+            return Ok(new_expr);
+        }
+        return Err(call);
+    }
+
     // Check that the property is `apply`
     match &callee_member.prop {
         MemberProp::Ident(ident_name) if ident_name.sym.as_ref() == "apply" => {}
@@ -317,6 +343,110 @@ fn try_convert_reflect_apply(
     }
 
     Some(make_direct_spread_call(*target_expr, output_arguments))
+}
+
+/// Recover `Reflect.construct(Target, argumentsList[, newTarget])` into a
+/// `new Target(...argumentsList)` expression.
+///
+/// A `new Target(...)` expression forces `new.target === Target`, so the
+/// three-argument form is only sound when the supplied `newTarget` is provably
+/// the same value as `Target`. Because a `new` expression evaluates its callee
+/// exactly once, a `newTarget` that re-reads a property (any member target)
+/// would collapse two reads into one and could observe a different value; we
+/// therefore accept the three-argument form only for a standalone identifier
+/// bound to a lexically stable binding, whose `newTarget` is the structurally
+/// identical identifier. Reads of such a binding during consecutive argument
+/// evaluation are side-effect-free and yield the same value.
+fn try_convert_reflect_construct(
+    call: &CallExpr,
+    callee_member: &MemberExpr,
+    unresolved_mark: Mark,
+    stable_bindings: &HashSet<BindingId>,
+    with_depth: usize,
+    top_level_direct_eval: bool,
+    direct_eval_scopes: &[Span],
+) -> Option<Expr> {
+    if with_depth > 0
+        || top_level_direct_eval
+        || direct_eval_scopes
+            .iter()
+            .any(|scope| scope.lo <= call.span.lo && call.span.hi <= scope.hi)
+    {
+        return None;
+    }
+    if !matches!(
+        callee_member.obj.as_ref(),
+        Expr::Ident(id) if is_unresolved_ident(id, "Reflect", unresolved_mark)
+    ) || !matches!(&callee_member.prop, MemberProp::Ident(id) if id.sym.as_ref() == "construct")
+    {
+        return None;
+    }
+    let arg_count = call.args.len();
+    if !(arg_count == 2 || arg_count == 3) || call.args.iter().any(|arg| arg.spread.is_some()) {
+        return None;
+    }
+
+    let target_expr = call.args[0].expr.clone();
+    let target = strip_transparent_types(target_expr.as_ref());
+
+    if matches!(target, Expr::Ident(id) if id.sym.as_ref() == "eval") {
+        return None;
+    }
+
+    if arg_count == 3 {
+        // newTarget correctness gate: standalone stable identifier only.
+        let Expr::Ident(target_ident) = target else {
+            return None;
+        };
+        if !stable_bindings.contains(&(target_ident.sym.clone(), target_ident.ctxt)) {
+            return None;
+        }
+        let new_target = strip_transparent_types(call.args[2].expr.as_ref());
+        if !exprs_structurally_equal(target, new_target) {
+            return None;
+        }
+    } else {
+        // Two-argument form: the target is evaluated exactly once in both the
+        // input and the recovered `new` expression. Standalone identifiers are
+        // always eligible; member targets require a stable receiver, matching
+        // the receiver rules used by the `Reflect.apply` recovery.
+        match target {
+            Expr::Ident(_) => {}
+            Expr::Member(member) => {
+                let receiver = strip_parens(member.obj.as_ref());
+                if !receiver_is_stable(receiver, stable_bindings)
+                    || !matches!(&member.prop, MemberProp::Ident(_) | MemberProp::Computed(_))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let arguments = Box::new(strip_parens_owned((*call.args[1].expr).clone()));
+    let normalized_arguments = strip_transparent_types(arguments.as_ref());
+
+    let output_arguments = if matches!(normalized_arguments, Expr::Array(_)) {
+        Box::new(normalized_arguments.clone())
+    } else {
+        arguments
+    };
+
+    Some(make_new_spread_call(*target_expr, output_arguments))
+}
+
+fn make_new_spread_call(callee: Expr, arguments: Box<Expr>) -> Expr {
+    Expr::New(NewExpr {
+        span: DUMMY_SP,
+        ctxt: SyntaxContext::empty(),
+        callee: Box::new(callee),
+        args: Some(vec![ExprOrSpread {
+            spread: Some(DUMMY_SP),
+            expr: arguments,
+        }]),
+        type_args: None,
+    })
 }
 
 fn is_reflect_nullish(expr: &Expr, unresolved_mark: Mark) -> bool {

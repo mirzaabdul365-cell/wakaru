@@ -36,3 +36,6 @@ tsconfig.tsbuildinfo
 # Local workspace
 .claude/
 .agents/
+
+# Task artifacts — keep local, never commit
+*.patch
