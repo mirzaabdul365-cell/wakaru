@@ -73,8 +73,9 @@ const x = void function() {
 
 #[test]
 fn does_not_transform_when_undefined_is_declared() {
-    // Reused from packages/unminify/src/transformations/__tests__/un-undefined.spec.ts
-    // VarDeclToLetConst converts `var undefined = 42` to `const` since it's never reassigned.
+    // A module-level `var undefined` shadows `undefined` in every scope, so
+    // `void 0` cannot be rewritten to the identifier `undefined` without changing
+    // meaning; it is left as-is.
     let input = r#"
 var undefined = 42;
 
@@ -86,9 +87,9 @@ if (undefined !== a) {
 "#;
     let expected = r#"
 var undefined = 42;
-console.log(undefined);
+console.log(void 0);
 if (undefined !== a) {
-  console.log('a', undefined);
+  console.log('a', void 0);
 }
 "#;
 
